@@ -34,6 +34,8 @@ final class Central {
     private let characteristicNotifyRegistry = PeripheralTaskRegistry<CharacteristicNotifyTaskController>()
     private let characteristicWriteRegistry = PeripheralTaskRegistry<CharacteristicWriteTaskController>()
     private let readRssiRegistry = PeripheralTaskRegistry<ReadRssiTaskController>()
+    /// 等待 CoreBluetooth write-without-response 缓冲区就绪的排队写入
+    private var pendingWritesWithoutResponse = [PeripheralID: [PendingWriteWithoutResponse]]()
 
     init(
         onStateChange: @escaping StateChangeHandler,
@@ -119,6 +121,9 @@ final class Central {
                     key: peripheral.identifier,
                     action: { $0.handleReadRssi(rssi: rssi, error: error) }
                 )
+            },
+            onReadyToSendWriteWithoutResponse: papply(weak: self) { central, peripheral in
+                central.flushPendingWritesWithoutResponse(for: peripheral)
             }
         )
         self.centralManager = CBCentralManager(
@@ -290,19 +295,56 @@ final class Central {
         )
     }
 
+    /// 带流控的 writeWithoutResponse：仅在缓冲区可写时下发，否则排队并等 ready 回调
     func writeWithoutResponse(
         value: Data,
-        characteristic characteristicInstance: CharacteristicInstance
+        characteristic characteristicInstance: CharacteristicInstance,
+        completion: @escaping CharacteristicWriteCompletionHandler
     ) throws {
         let characteristic = try resolve(characteristic: characteristicInstance)
 
         guard characteristic.properties.contains(.writeWithoutResponse)
         else { throw Failure.notWritable(characteristicInstance) }
 
-        guard let response = characteristic.service?.peripheral?.writeValue(value, for: characteristic, type: .withoutResponse)
-        else { throw Failure.characteristicNotFound(characteristicInstance) }
+        guard let peripheral = characteristic.service?.peripheral
+        else { throw Failure.peripheralIsUnknown(characteristicInstance.peripheralID) }
 
-        return response
+        var queue = pendingWritesWithoutResponse[peripheral.identifier] ?? []
+        queue.append(PendingWriteWithoutResponse(
+            value: value,
+            characteristicInstance: characteristicInstance,
+            completion: completion
+        ))
+        pendingWritesWithoutResponse[peripheral.identifier] = queue
+
+        flushPendingWritesWithoutResponse(for: peripheral)
+    }
+
+    /// 尽可能刷出队列中的 writeWithoutResponse，遵循 canSendWriteWithoutResponse
+    private func flushPendingWritesWithoutResponse(for peripheral: CBPeripheral) {
+        while true {
+            guard var queue = pendingWritesWithoutResponse[peripheral.identifier], !queue.isEmpty
+            else { return }
+
+            if !peripheral.canSendWriteWithoutResponse {
+                return
+            }
+
+            let pending = queue.removeFirst()
+            if queue.isEmpty {
+                pendingWritesWithoutResponse[peripheral.identifier] = nil
+            } else {
+                pendingWritesWithoutResponse[peripheral.identifier] = queue
+            }
+
+            do {
+                let characteristic = try resolve(characteristic: pending.characteristicInstance)
+                peripheral.writeValue(pending.value, for: characteristic, type: .withoutResponse)
+                pending.completion(self, pending.characteristicInstance, nil)
+            } catch {
+                pending.completion(self, pending.characteristicInstance, error)
+            }
+        }
     }
 
     func maximumWriteValueLength(for peripheral: PeripheralID, type: CBCharacteristicWriteType) throws -> Int {
@@ -344,6 +386,20 @@ final class Central {
             in: peripheral.identifier,
             action: { $0.cancel(error: error) }
         )
+
+        if let pending = pendingWritesWithoutResponse.removeValue(forKey: peripheral.identifier) {
+            pending.forEach { $0.completion(self, $0.characteristicInstance, error) }
+        }
+    }
+
+    /// 单条排队中的 writeWithoutResponse
+    private struct PendingWriteWithoutResponse {
+        /// 待写入数据
+        let value: Data
+        /// 特征实例标识
+        let characteristicInstance: CharacteristicInstance
+        /// 写入被协议栈接受后的完成回调
+        let completion: CharacteristicWriteCompletionHandler
     }
 
     private func resolve(known peripheralID: PeripheralID) throws -> CBPeripheral {
